@@ -1,0 +1,270 @@
+function panorama = stitch_simple(imgLA_in, imgLB_in, imgRA_in, imgRB_in)
+
+%% Load 4 input images (edit paths or pass matrices)
+LA = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenO.jpg');
+LB = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenT.jpg');
+RA = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenTH.jpg');
+RB = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenF.jpg');
+
+% ----------------- MINIMAL RESOLUTION INCREASE -----------------
+LA = imresize(LA, 1.2);
+LB = imresize(LB, 1.2);
+RA = imresize(RA, 1.2);
+RB = imresize(RB, 1.2);
+% ----------------------------------------------------------------
+
+
+figure; imshow(LA); title('Left Above');
+figure; imshow(RA); title('Right Above');
+figure; imshow(LB); title('Left Below');
+figure; imshow(RB); title('Right Below');
+
+%% STEP 1: Stitch Left-Above + Right-Above → TOP (NO enhancement)
+fprintf("\n--- Stitching TOP (LA + RA) ---\n");
+topPanorama = stitch_two_images_internal(LA, RA, false);  % doEnhance = false
+figure; imshow(topPanorama); title('TOP Panorama (LA + RA)');
+
+%% STEP 2: Stitch Left-Below + Right-Below → BOTTOM (NO enhancement)
+fprintf("\n--- Stitching BOTTOM (LB + RB) ---\n");
+bottomPanorama = stitch_two_images_internal(LB, RB, false);  % doEnhance = false
+figure; imshow(bottomPanorama); title('BOTTOM Panorama (LB + RB)');
+
+%% STEP 3: Stitch TOP + BOTTOM → FINAL (Enhance final only)
+fprintf("\n--- Stitching FINAL (TOP + BOTTOM) ---\n");
+panorama = stitch_two_images_internal(topPanorama, bottomPanorama, true);  % doEnhance = true
+figure; imshow(panorama); title('Final 4-image Panorama');
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ----------------- 2-IMAGE STITCHING PIPELINE --------------------------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function panorama = stitch_two_images_internal(img1_in, img2_in, doEnhance)
+% Performs 2-image stitch. Enhancement is done only when doEnhance==true.
+
+if nargin < 3, doEnhance = true; end  % default: enhance
+
+%% ---------- Start timer ----------
+t_global = tic;
+
+%% 1. Load images
+img1 = load_image(img1_in);
+img2 = load_image(img2_in);
+
+figure; imshow(img1); title('Input Image 1');
+figure; imshow(img2); title('Input Image 2');
+
+% ----------------------------------------------------------------
+
+
+%% 2. Resize if too large
+MAX_SIZE = 1200;
+img1 = resize_if_large(img1, MAX_SIZE);
+img2 = resize_if_large(img2, MAX_SIZE);
+
+gray1 = rgb2gray(img1);
+gray2 = rgb2gray(img2);
+
+%% 3. Detect features (SURF or fallback to Harris)
+try
+    pts1 = detectSURFFeatures(gray1);
+    pts2 = detectSURFFeatures(gray2);
+catch
+    warning('SURF not available; using Harris features.');
+    pts1 = detectHarrisFeatures(gray1);
+    pts2 = detectHarrisFeatures(gray2);
+end
+
+pts1 = pts1.selectStrongest(2500);
+pts2 = pts2.selectStrongest(2500);
+
+figure; imshow(img1); hold on; plot(pts1.selectStrongest(200)); title('Features 1'); hold off;
+figure; imshow(img2); hold on; plot(pts2.selectStrongest(200)); title('Features 2'); hold off;
+drawnow;
+
+%% Measurement: Feature counts
+fprintf("Detected Features → Image1 = %d , Image2 = %d\n", pts1.Count, pts2.Count);
+
+%% 4. Extract and match features
+[feat1, valid1] = extractFeatures(gray1, pts1);
+[feat2, valid2] = extractFeatures(gray2, pts2);
+
+pairs = matchFeatures(feat1, feat2, ...
+    'MatchThreshold', 50, ...
+    'MaxRatio', 0.7, ...
+    'Unique', true, ...
+    'Method', 'Approximate');
+
+if isempty(pairs)
+    error('No matches found!');
+end
+
+matched1 = valid1(pairs(:,1));
+matched2 = valid2(pairs(:,2));
+
+figure; showMatchedFeatures(img1, img2, matched1, matched2, 'montage');
+title('Matched Features');
+drawnow;
+
+%% Measurement: Matched count
+fprintf("Matched Features = %d\n", size(pairs,1));
+
+%% 5. RANSAC transform estimation
+[tform, inlierIdx] = estimateGeometricTransform2D(matched2, matched1, ...
+    'projective', 'MaxNumTrials', 5000, 'Confidence', 99.9);
+
+in1 = matched1(inlierIdx);
+in2 = matched2(inlierIdx);
+
+figure; showMatchedFeatures(img1, img2, in1, in2, 'montage');
+title(sprintf('Inliers (%d matches)', in1.Count));
+drawnow;
+
+%% Measurement: Inlier count
+fprintf("RANSAC Inliers = %d\n", in1.Count);
+
+%% 6. Warp images and compute panorama canvas
+[x1, y1] = outputLimits(affine2d(eye(3)), [1 size(img1,2)], [1 size(img1,1)]);
+[x2, y2] = outputLimits(tform, [1 size(img2,2)], [1 size(img2,1)]);
+
+xMin = floor(min([x1(:); x2(:)]));
+xMax = ceil(max([x1(:); x2(:)]));
+yMin = floor(min([y1(:); y2(:)]));
+yMax = ceil(max([y1(:); y2(:)]));
+
+W = xMax - xMin;
+H = yMax - yMin;
+
+panRef = imref2d([H W], [xMin xMax], [yMin yMax]);
+
+warp1 = imwarp(img1, affine2d(eye(3)), 'OutputView', panRef);
+warp2 = imwarp(img2, tform, 'OutputView', panRef);
+
+%% 7. Create overlap masks
+mask1 = imwarp(true(size(img1,1), size(img1,2)), affine2d(eye(3)), 'OutputView', panRef);
+mask2 = imwarp(true(size(img2,1), size(img2,2)), tform, 'OutputView', panRef);
+
+figure('Name',['Masks - ' inputname(1)],'NumberTitle','off');
+subplot(1,2,1), imshow(mask1), title('Mask1');
+subplot(1,2,2), imshow(mask2), title('Mask2');
+drawnow;
+
+%% 8. Feather blending
+d1 = bwdist(~mask1);
+d2 = bwdist(~mask2);
+
+W1 = d1 ./ (d1 + d2 + eps);
+W2 = d2 ./ (d1 + d2 + eps);
+
+W1(~mask1) = 0;
+W2(~mask2) = 0;
+
+p = im2double(warp1).*W1 + im2double(warp2).*W2;
+p = im2uint8(p);
+
+%% 9. Enhancement (ONLY when doEnhance = true — i.e., final panorama)
+% NOTE: this block executes only for final panorama (doEnhance==true).
+if doEnhance
+    try
+        lab = rgb2lab(p);
+        L = lab(:,:,1)/100;
+        % Mild CLAHE parameters to avoid over-enhancement
+        L = adapthisteq(L,'NumTiles',[8 8],'ClipLimit',0.02);
+        lab(:,:,1) = L*100;
+        panorama = im2uint8(lab2rgb(lab));
+        catch1
+        % fallback: per-channel adapthisteq
+        panorama = p;
+        for c = 1:9
+            panorama(:,:,c) = im2uint8(adapthisteq(im2double(p(:,:,c))));
+        end
+    end
+
+    % Optional denoising (only if available)
+    if exist('imnlmfilt','file')
+        try
+            panorama = imnlmfilt(panorama);
+        catch
+            % ignore if imnlmfilt fails
+        end
+    end
+
+    % Mild sharpening
+    panorama = imsharpen(panorama,'Radius',1,'Amount',0.7);
+else
+    % For intermediate panoramas (TOP/BOTTOM) do NOT enhance
+    panorama = p;
+end
+
+%% 10. YOLO detection (runs on whatever 'panorama' is — final will be enhanced)
+detector = get_detector();
+
+if ~isempty(detector)
+    try
+        [bboxes, scores, labels] = detect(detector, panorama);
+        figure('Name',['YOLO Detections - ' inputname(1)], 'NumberTitle','off'); 
+        imshow(panorama); hold on;
+        for i = 1:size(bboxes,1)
+            rectangle('Position', bboxes(i,:), 'EdgeColor','g', 'LineWidth', 2);
+            text(bboxes(i,1), max(5,bboxes(i,2)-10), sprintf('%s (%.2f)', string(labels(i)), scores(i)), ...
+                'Color','y', 'FontSize', 10, 'FontWeight', 'bold', 'BackgroundColor', 'black');
+        end
+        title(['YOLO Detections - ' inputname(1)]); hold off; drawnow;
+    catch ME
+        warning('YOLO detection failed for %s: %s', inputname(1), ME.message);
+    end
+end
+
+%% End timer and print
+elapsed = toc(t_global);
+fprintf("Processing Time = %.3f seconds\n", elapsed);
+
+end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ------------------------ Helper functions ------------------------------
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function img = load_image(x)
+% load_image accepts either a file path or image matrix
+    if ischar(x) || isstring(x)
+        if ~isfile(x)
+            error('File not found: %s', x);
+        end
+        img = imread(x);
+    else
+        img = x;
+    end
+    if size(img,3)==1
+        img = repmat(img,[1 1 3]);
+    end
+end
+
+function img = resize_if_large(img, MAX)
+    scale = MAX / max(size(img,1), size(img,2));
+    if scale < 1
+        img = imresize(img, scale);
+    end
+end
+
+function detector = get_detector()
+% Try to get tiny-yolov2 first then yolov2, fallback to cascade detector
+    detector = [];
+    try
+        detector = yolov2ObjectDetector('tiny-yolov2-coco');
+        return;
+    catch
+    end
+    try
+        detector = yolov2ObjectDetector('yolov2-coco');
+        return;
+    catch
+    end
+    try
+        detector = vision.CascadeObjectDetector();
+        return;
+    catch
+        detector = [];
+    end
+end
