@@ -1,0 +1,216 @@
+function panorama = stitch_simple(imgLA_in, imgLB_in, imgRA_in, imgRB_in)
+
+% Load 4 input images
+LA = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenO.jpg');
+LB = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenT.jpg');
+RA = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenTH.jpg');
+RB = load_image('C:\Users\BASAVARAJU\MATLAB Drive\Processproject\cafourteenF.jpg');
+% ----------------- MINIMAL RESOLUTION INCREASE -----------------
+LA = imresize(LA, 1.2);
+
+LB = imresize(LB, 1.2);
+RA = imresize(RA, 1.2);
+RB = imresize(RB, 1.2);
+% ----------------------------------------------------------------
+
+figure('Name','Inputs','NumberTitle','off');
+subplot(2,2,1), imshow(LA), title('Left-Above (LA)');
+subplot(2,2,2), imshow(RA), title('Right-Above (RA)');
+subplot(2,2,3), imshow(LB), title('Left-Below (LB)');
+subplot(2,2,4), imshow(RB), title('Right-Below (RB)');
+drawnow;
+
+% Stitch TOP (LA + RA) — no enhancement, no detection
+fprintf("\n--- Stitching TOP (LA + RA) ---\n");
+topPanorama = stitch_two_images_internal(LA, RA, 'TOP');
+figure('Name','Top Panorama','NumberTitle','off'); imshow(topPanorama); title('TOP Panorama (LA + RA)');
+
+% Stitch BOTTOM (LB + RB) — no enhancement, no detection
+fprintf("\n--- Stitching BOTTOM (LB + RB) ---\n");
+bottomPanorama = stitch_two_images_internal(LB, RB, 'BOTTOM');
+figure('Name','Bottom Panorama','NumberTitle','off'); imshow(bottomPanorama); title('BOTTOM Panorama (LB + RB)');
+
+% Stitch FINAL (TOP + BOTTOM) — enhancement + YOLO detection only here
+fprintf("\n--- Stitching FINAL (TOP + BOTTOM) ---\n");
+panorama = stitch_two_images_internal(topPanorama, bottomPanorama, 'FINAL');
+figure('Name','Final Panorama','NumberTitle','off'); imshow(panorama); title('Final 4-image Panorama');
+
+end
+
+%% Internal stitching function
+function panorama = stitch_two_images_internal(img1, img2, tag)
+if nargin < 3, tag = ''; end
+
+doEnhance = strcmpi(tag, 'FINAL');
+
+MAX_SIZE = 1200;
+img1r = resize_if_large(img1, MAX_SIZE);
+img2r = resize_if_large(img2, MAX_SIZE);
+
+figure('Name',[' Plot Input - ' tag],'NumberTitle','off');
+subplot(1,2,1), imshow(img1r), title(['Image1 - ' tag]);
+subplot(1,2,2), imshow(img2r), title(['Image2 - ' tag]);
+drawnow;
+
+gray1 = rgb2gray(img1r);
+gray2 = rgb2gray(img2r);
+
+fprintf('Detecting SIFT features (%s)...\n', tag);
+pts1 = detectSIFTFeatures(gray1);
+pts2 = detectSIFTFeatures(gray2);
+
+figure('Name',['SIFT Keypoints - ' tag],'NumberTitle','off');
+subplot(1,2,1), imshow(img1r), hold on, plot(pts1.selectStrongest(200)), title('Keypoints Image1');
+subplot(1,2,2), imshow(img2r), hold on, plot(pts2.selectStrongest(200)), title('Keypoints Image2');
+drawnow;
+
+pts1 = pts1.selectStrongest(3000);
+pts2 = pts2.selectStrongest(3000);
+
+[feat1, valid1] = extractFeatures(gray1, pts1, 'Method','SIFT');
+[feat2, valid2] = extractFeatures(gray2, pts2, 'Method','SIFT');
+
+pairs = matchFeatures(feat1, feat2, 'MatchThreshold', 90, 'MaxRatio', 0.8, 'Unique', true);
+if isempty(pairs)
+    error('No SIFT matches found (%s)!', tag);
+end
+
+matched1 = valid1(pairs(:,1));
+matched2 = valid2(pairs(:,2));
+
+figure('Name',['Initial Matches - ' tag],'NumberTitle','off');
+showMatchedFeatures(img1r, img2r, matched1, matched2, 'montage');
+title(['Initial SIFT Matches - ' tag]);
+drawnow;
+
+fprintf("Detected features (img1) = %d, (img2) = %d\n", pts1.Count, pts2.Count);
+fprintf("Initial matched pairs = %d\n", size(pairs,1));
+
+fprintf('Estimating transform with RANSAC (%s)...\n', tag);
+[tform, inlierIdx] = estimateGeometricTransform2D(matched2, matched1, ...
+    'projective', 'MaxNumTrials', 6000, 'Confidence', 99.9);
+
+inlier1 = matched1(inlierIdx);
+inlier2 = matched2(inlierIdx);
+
+figure('Name',['RANSAC Inliers - ' tag],'NumberTitle','off');
+showMatchedFeatures(img1r, img2r, inlier1, inlier2, 'montage');
+title(sprintf('RANSAC Inlier Matches (%d) - %s', inlier1.Count, tag));
+drawnow;
+
+fprintf("RANSAC inliers = %d\n", inlier1.Count);
+
+[x1_lim, y1_lim] = outputLimits(affine2d(eye(3)), [1 size(img1r,2)], [1 size(img1r,1)]);
+[x2_lim, y2_lim] = outputLimits(tform, [1 size(img2r,2)], [1 size(img2r,1)]);
+
+xMin = floor(min([x1_lim(:); x2_lim(:)]));
+xMax = ceil(max([x1_lim(:); x2_lim(:)]));
+yMin = floor(min([y1_lim(:); y2_lim(:)]));
+yMax = ceil(max([y1_lim(:); y2_lim(:)]));
+
+W = xMax - xMin;
+H = yMax - yMin;
+panRef = imref2d([H W], [xMin xMax], [yMin yMax]);
+
+warp1 = imwarp(img1r, affine2d(eye(3)), 'OutputView', panRef);
+warp2 = imwarp(img2r, tform, 'OutputView', panRef);
+
+figure('Name',['Warped Images - ' tag],'NumberTitle','off');
+subplot(1,2,1), imshow(warp1), title(['Warped Image1 - ' tag]);
+subplot(1,2,2), imshow(warp2), title(['Warped Image2 - ' tag]);
+drawnow;
+
+mask1 = imwarp(true(size(img1r,1), size(img1r,2)), affine2d(eye(3)), 'OutputView', panRef);
+mask2 = imwarp(true(size(img2r,1), size(img2r,2)), tform, 'OutputView', panRef);
+
+d1 = bwdist(~mask1);
+d2 = bwdist(~mask2);
+
+W1 = d1 ./ (d1 + d2 + eps);
+W2 = d2 ./ (d1 + d2 + eps);
+
+blend_raw = im2double(warp1).*W1 + im2double(warp2).*W2;
+blend_raw_u = im2uint8(blend_raw);
+
+if doEnhance
+    try
+        lab = rgb2lab(blend_raw_u);
+        L = lab(:,:,1)/100;
+        L = adapthisteq(L,'NumTiles',[8 8],'ClipLimit',0.02);
+        lab(:,:,1) = L*100;
+        panorama = im2uint8(lab2rgb(lab));
+    catch
+        panorama = blend_raw_u;
+    end
+
+    if exist('imnlmfilt','file')
+        try panorama = imnlmfilt(panorama); catch, end
+    end
+
+    panorama = imsharpen(panorama,'Radius',1,'Amount',0.6);
+else
+    panorama = blend_raw_u;
+end
+
+if doEnhance
+    figure('Name',['Enhanced (FINAL) - ' tag],'NumberTitle','off');
+    imshow(panorama), title('Enhanced FINAL Panorama');
+    drawnow;
+else
+    figure('Name',['Intermediate Panorama - ' tag],'NumberTitle','off');
+    imshow(panorama), title(['Intermediate Panorama - ' tag ' (No Enhancement)']);
+    drawnow;
+end
+
+[B1,~] = bwboundaries(mask1);
+[B2,~] = bwboundaries(mask2);
+
+figure('Name',['Mask Overlay - ' tag],'NumberTitle','off'); imshow(panorama); hold on;
+for k = 1:length(B1), plot(B1{k}(:,2), B1{k}(:,1), 'g', 'LineWidth', 1); end
+for k = 1:length(B2), plot(B2{k}(:,2), B2{k}(:,1), 'r', 'LineWidth', 1); end
+hold off; drawnow;
+
+if doEnhance
+    detector = get_detector();
+    if ~isempty(detector)
+        try
+            [bboxes, scores, labels] = detect(detector, panorama);
+            figure('Name',['YOLO Detections - ' tag],'NumberTitle','off'); imshow(panorama); hold on;
+            for i = 1:size(bboxes,1)
+                rectangle('Position', bboxes(i,:), 'EdgeColor','g', 'LineWidth', 2);
+                text(bboxes(i,1), max(5,bboxes(i,2)-10), sprintf('%s (%.2f)', string(labels(i)), scores(i)), ...
+                    'Color','y', 'FontSize', 10, 'FontWeight', 'bold', 'BackgroundColor', 'black');
+            end
+            hold off; drawnow;
+        catch ME
+            warning('YOLO detection failed for %s: %s', tag, ME.message);
+        end
+    else
+        fprintf('No detector available (skipping YOLO for %s).\n', tag);
+    end
+end
+end
+
+%% Helper functions
+function img = load_image(x)
+    if ischar(x) || isstring(x)
+        if ~isfile(x), error('File not found: %s', x); end
+        img = imread(x);
+    else
+        img = x;
+    end
+    if size(img,3) == 1, img = repmat(img, [1 1 3]); end
+end
+
+function img = resize_if_large(img, MAX)
+    scale = MAX / max(size(img,1), size(img,2));
+    if scale < 1, img = imresize(img, scale); end
+end
+
+function detector = get_detector()
+    detector = [];
+    try detector = yolov2ObjectDetector('tiny-yolov2-coco'); return; catch; end
+    try detector = yolov2ObjectDetector('yolov2-coco'); return; catch; end
+    try detector = vision.CascadeObjectDetector(); return; catch; end
+    detector = [];
+end
